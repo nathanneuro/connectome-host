@@ -1,0 +1,1 @@
+`lessons--query` and `lessons--list` report `shown` of `total` matches among `searched` lessons, so an agent can tell "nothing matched" from "nothing exists" (`query`'s `count` is now `total`). A requested tag that no searched lesson carries comes back in `unknownTags`, with the 30 most-used `knownTags`, instead of reading as "no lessons about this".

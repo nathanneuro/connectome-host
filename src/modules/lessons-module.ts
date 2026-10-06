@@ -143,6 +143,43 @@ export function rankScore(lesson: Lesson, now: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Tag filters
+// ---------------------------------------------------------------------------
+
+/** Most-used tags listed when a requested tag matches nothing. */
+const KNOWN_TAGS_SHOWN = 30;
+
+/** Lessons carrying any of `tags` (case-insensitive); all of them when no tags are given. */
+function filterByTags(lessons: Lesson[], tags: string[] | undefined): Lesson[] {
+  if (!tags || tags.length === 0) return lessons;
+  const wanted = new Set(tags.map(t => t.toLowerCase()));
+  return lessons.filter(l => l.tags.some(t => wanted.has(t.toLowerCase())));
+}
+
+/**
+ * Requested tags that no searched lesson carries, with the tags that do exist,
+ * most-used first. A mistyped or invented tag otherwise reads as "no lessons
+ * about this", which is a different and wrong answer.
+ */
+function checkTags(
+  tags: string[] | undefined,
+  lessons: Lesson[],
+): { unknownTags: string[]; knownTags: string[] } | Record<string, never> {
+  if (!tags || tags.length === 0) return {};
+  const uses = new Map<string, number>();
+  for (const l of lessons) {
+    for (const t of new Set(l.tags.map(t => t.toLowerCase()))) uses.set(t, (uses.get(t) ?? 0) + 1);
+  }
+  const unknownTags = tags.filter(t => !uses.has(t.toLowerCase()));
+  if (unknownTags.length === 0) return {};
+  const knownTags = [...uses.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, KNOWN_TAGS_SHOWN)
+    .map(([t]) => t);
+  return { unknownTags, knownTags };
+}
+
+// ---------------------------------------------------------------------------
 // Near-duplicate detection
 // ---------------------------------------------------------------------------
 //
@@ -247,7 +284,8 @@ export class LessonsModule implements Module {
       },
       {
         name: 'query',
-        description: 'Search lessons by text and/or tags.',
+        description: 'Search lessons by text and/or tags.' +
+          ' Results report `shown` of `total` matches among `searched` lessons: zero matches is not proof none exist. A tag no lesson carries is reported in `unknownTags`, with the `knownTags` to choose from.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -264,7 +302,8 @@ export class LessonsModule implements Module {
       },
       {
         name: 'list',
-        description: 'List all lessons, optionally filtered and sorted.',
+        description: 'List all lessons, optionally filtered and sorted.' +
+          ' Results report `shown` of `total` matches among `searched` lessons: zero matches is not proof none exist. A tag no lesson carries is reported in `unknownTags`, with the `knownTags` to choose from.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -466,13 +505,9 @@ export class LessonsModule implements Module {
       results = results.filter(l => l.confidence >= input.minConfidence!);
     }
 
-    // Filter by tags (any match)
-    if (input.tags && input.tags.length > 0) {
-      const tagSet = new Set(input.tags.map(t => t.toLowerCase()));
-      results = results.filter(l =>
-        l.tags.some(t => tagSet.has(t.toLowerCase()))
-      );
-    }
+    const searched = results.length;
+    const tagCheck = checkTags(input.tags, results);
+    results = filterByTags(results, input.tags);
 
     // Text search (simple keyword matching)
     if (input.text) {
@@ -489,7 +524,10 @@ export class LessonsModule implements Module {
     return {
       success: true,
       data: {
-        count: results.length,
+        total: results.length,
+        shown: Math.min(limit, results.length),
+        searched,
+        ...tagCheck,
         lessons: results.slice(0, limit).map(l => ({
           id: l.id,
           content: l.content,
@@ -512,13 +550,9 @@ export class LessonsModule implements Module {
       ? [...this.state.lessons]
       : this.state.lessons.filter(l => !l.deprecated);
 
-    // Filter by tags
-    if (input.tags && input.tags.length > 0) {
-      const tagSet = new Set(input.tags.map(t => t.toLowerCase()));
-      results = results.filter(l =>
-        l.tags.some(t => tagSet.has(t.toLowerCase()))
-      );
-    }
+    const searched = results.length;
+    const tagCheck = checkTags(input.tags, results);
+    results = filterByTags(results, input.tags);
 
     // Sort
     const sort = input.sort ?? 'confidence';
@@ -543,6 +577,9 @@ export class LessonsModule implements Module {
       success: true,
       data: {
         total: results.length,
+        shown: Math.min(limit, results.length),
+        searched,
+        ...tagCheck,
         lessons: results.slice(0, limit).map(l => ({
           id: l.id,
           content: l.content,

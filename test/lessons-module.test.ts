@@ -188,9 +188,37 @@ describe('nothing is lost', () => {
       id: 'q', name: 'query', input: { text: 'alice', includeDeprecated: true },
     } as never);
 
-    expect((live.data as { count: number }).count).toBe(0);
+    expect(live.data).toMatchObject({ total: 0, shown: 0, searched: 1 });
     expect((archive.data as { lessons: Array<{ id: string; supersededBy?: string }> }).lessons)
       .toMatchObject([{ id: oldId, supersededBy: expect.any(String) }]);
+  });
+});
+
+describe('query and list report what they searched', () => {
+  test('shown of total among searched, so no match reads differently from no data', async () => {
+    const mod = await started();
+    for (const content of ['Deploys freeze on Fridays', 'Deploy keys rotate monthly', 'Billing runs nightly']) {
+      await create(mod, { content, tags: ['ops'] });
+    }
+
+    const query = await mod.handleToolCall({ id: 'q', name: 'query', input: { text: 'deploy', limit: 1 } } as never);
+    expect(query.data).toMatchObject({ total: 2, shown: 1, searched: 3 });
+    const none = await mod.handleToolCall({ id: 'q', name: 'query', input: { text: 'kubernetes' } } as never);
+    expect(none.data).toMatchObject({ total: 0, shown: 0, searched: 3 });
+    const list = await mod.handleToolCall({ id: 'l', name: 'list', input: { limit: 2 } } as never);
+    expect(list.data).toMatchObject({ total: 3, shown: 2, searched: 3 });
+  });
+
+  test('a tag no lesson carries is reported with the tags that exist', async () => {
+    const mod = await started();
+    await create(mod, { content: 'Deploys freeze on Fridays', tags: ['ops', 'Process'] });
+    await create(mod, { content: 'Alice owns billing', tags: ['people', 'ops'] });
+
+    const query = await mod.handleToolCall({ id: 'q', name: 'query', input: { tags: ['opps', 'process'] } } as never);
+    expect(query.data).toMatchObject({ total: 1, unknownTags: ['opps'], knownTags: ['ops', 'people', 'process'] });
+    const known = await mod.handleToolCall({ id: 'l', name: 'list', input: { tags: ['OPS'] } } as never);
+    expect(known.data).not.toHaveProperty('unknownTags');
+    expect(known.data).toMatchObject({ total: 2 });
   });
 });
 
