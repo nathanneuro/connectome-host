@@ -1,6 +1,6 @@
 /**
  * Lexical search over lessons: one tokenizer shared by the near-duplicate
- * gate and retrieval's shortlist, plus Okapi BM25.
+ * gate and retrieval's shortlist, plus an incremental Okapi BM25 index.
  *
  * Lexical search is only the shortlist for libraries too large to show the
  * relevance model whole; the semantic judgment is always the model's.
@@ -40,29 +40,77 @@ function lessonTokens(lesson: Lesson): string[] {
 const K1 = 1.2;
 const B = 0.75;
 
-/** BM25 score of every lesson against the query, in input order. Zero = no shared term. */
-export function bm25Scores(query: string, lessons: Lesson[]): number[] {
-  const queryTerms = [...new Set(tokenize(query))];
-  const docs = lessons.map(lessonTokens);
-  if (queryTerms.length === 0 || docs.length === 0) return docs.map(() => 0);
+interface IndexedDoc {
+  key: string;
+  termFreq: Map<string, number>;
+  length: number;
+}
 
-  const avgLength = docs.reduce((sum, d) => sum + d.length, 0) / docs.length;
-  const docFreq = new Map<string, number>();
-  for (const doc of docs) {
-    for (const term of new Set(doc)) docFreq.set(term, (docFreq.get(term) ?? 0) + 1);
+/**
+ * Okapi BM25 over an inverted index kept in step with the library. `sync`
+ * re-tokenizes only lessons whose text changed, and a query reads only the
+ * postings of its own terms, so per-query cost follows the matches rather
+ * than the size of the library.
+ */
+export class LexicalIndex {
+  private readonly docs = new Map<string, IndexedDoc>();
+  private readonly postings = new Map<string, Set<string>>();
+  private totalLength = 0;
+
+  /** Make the index hold exactly `lessons`. */
+  sync(lessons: Lesson[]): void {
+    const live = new Set<string>();
+    for (const lesson of lessons) {
+      live.add(lesson.id);
+      const key = `${lesson.content}\u0000${lesson.tags.join('\u0000')}`;
+      const doc = this.docs.get(lesson.id);
+      if (doc?.key === key) continue;
+      if (doc) this.remove(lesson.id);
+      this.add(lesson.id, key, lessonTokens(lesson));
+    }
+    for (const id of [...this.docs.keys()]) if (!live.has(id)) this.remove(id);
   }
 
-  return docs.map(doc => {
-    const termFreq = new Map<string, number>();
-    for (const term of doc) termFreq.set(term, (termFreq.get(term) ?? 0) + 1);
-    let score = 0;
-    for (const term of queryTerms) {
-      const tf = termFreq.get(term);
-      if (!tf) continue;
-      const df = docFreq.get(term)!;
-      const idf = Math.log(1 + (docs.length - df + 0.5) / (df + 0.5));
-      score += idf * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * doc.length / Math.max(avgLength, 1)));
+  /** BM25 score of every lesson sharing a term with the query; absent = zero. */
+  scores(query: string): Map<string, number> {
+    const scores = new Map<string, number>();
+    const n = this.docs.size;
+    if (n === 0) return scores;
+    const avgLength = Math.max(this.totalLength / n, 1);
+    for (const term of new Set(tokenize(query))) {
+      const ids = this.postings.get(term);
+      if (!ids) continue;
+      const idf = Math.log(1 + (n - ids.size + 0.5) / (ids.size + 0.5));
+      for (const id of ids) {
+        const doc = this.docs.get(id)!;
+        const tf = doc.termFreq.get(term)!;
+        const score = idf * (tf * (K1 + 1)) / (tf + K1 * (1 - B + B * doc.length / avgLength));
+        scores.set(id, (scores.get(id) ?? 0) + score);
+      }
     }
-    return score;
-  });
+    return scores;
+  }
+
+  private add(id: string, key: string, tokens: string[]): void {
+    const termFreq = new Map<string, number>();
+    for (const term of tokens) termFreq.set(term, (termFreq.get(term) ?? 0) + 1);
+    for (const term of termFreq.keys()) {
+      let ids = this.postings.get(term);
+      if (!ids) this.postings.set(term, ids = new Set());
+      ids.add(id);
+    }
+    this.docs.set(id, { key, termFreq, length: tokens.length });
+    this.totalLength += tokens.length;
+  }
+
+  private remove(id: string): void {
+    const doc = this.docs.get(id)!;
+    for (const term of doc.termFreq.keys()) {
+      const ids = this.postings.get(term)!;
+      ids.delete(id);
+      if (ids.size === 0) this.postings.delete(term);
+    }
+    this.docs.delete(id);
+    this.totalLength -= doc.length;
+  }
 }

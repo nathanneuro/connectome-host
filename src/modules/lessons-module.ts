@@ -18,6 +18,11 @@
  *
  * Injection into the agent's context is RetrievalModule's job; it reports
  * each injection back via recordRetrieval().
+ *
+ * Storage is append-only, so a write costs the size of what changed, never
+ * the size of the library: each write appends the new version of each lesson
+ * it touched, and each retrieval appends one event. Usage strength is derived
+ * by replaying those events, never stored.
  */
 
 import type {
@@ -62,8 +67,20 @@ export interface Lesson {
   stability?: number;
 }
 
-interface LessonsState {
-  lessons: Lesson[];
+/** A lesson's content after one write: everything but the usage fields, which the retrieval log derives. */
+type LessonVersion = Omit<Lesson, 'retrievalCount' | 'lastRetrieved' | 'stability'>;
+
+/** One retrieval of `ids`, or the usage a store carried when it moved onto the logs. */
+type RetrievalEvent =
+  | { at: number; ids: string[] }
+  | { at: number; baseline: Array<Pick<Lesson, 'id' | 'retrievalCount' | 'lastRetrieved' | 'stability'>> };
+
+const VERSIONS_LOG = 'versions';
+const RETRIEVALS_LOG = 'retrievals';
+
+function versionOf(lesson: Lesson): LessonVersion {
+  const { retrievalCount: _c, lastRetrieved: _l, stability: _s, ...version } = lesson;
+  return version;
 }
 
 interface CreateInput {
@@ -199,7 +216,8 @@ export class LessonsModule implements Module {
   readonly name = 'lessons';
 
   private ctx: ModuleContext | null = null;
-  private state: LessonsState = { lessons: [] };
+  private lessons: Lesson[] = [];
+  private byId = new Map<string, Lesson>();
   private globalPath: string | null;
 
   constructor(opts?: { globalPath?: string }) {
@@ -208,14 +226,17 @@ export class LessonsModule implements Module {
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
-    const saved = ctx.getState<LessonsState>();
-    if (saved) {
-      this.state = saved;
-    }
+    this.lessons = [];
+    this.byId = new Map();
+    ctx.registerLogState(VERSIONS_LOG);
+    ctx.registerLogState(RETRIEVALS_LOG);
+    if (ctx.getLogLength(VERSIONS_LOG) === 0) this.migrateSnapshot(ctx);
+    for (const version of ctx.getLog<LessonVersion>(VERSIONS_LOG)) this.applyVersion(version);
     // Merge in lessons from the global shared file
     if (this.globalPath) {
-      this.mergeFromGlobal();
+      this.mergeFromGlobal(ctx);
     }
+    for (const event of ctx.getLog<RetrievalEvent>(RETRIEVALS_LOG)) this.applyRetrieval(event);
   }
 
   async stop(): Promise<void> {
@@ -365,7 +386,7 @@ export class LessonsModule implements Module {
 
   // Public accessor for other modules (e.g., RetrievalModule)
   getLessons(): Lesson[] {
-    return this.state.lessons;
+    return this.lessons;
   }
 
   /**
@@ -375,15 +396,59 @@ export class LessonsModule implements Module {
    */
   recordRetrieval(ids: string[], now = Date.now()): void {
     for (const id of ids) {
-      const lesson = this.state.lessons.find(l => l.id === id);
-      if (!lesson) throw new Error(`recordRetrieval: lesson not found: ${id}`);
-      const r = retrievability(lesson, now);
+      if (!this.byId.has(id)) throw new Error(`recordRetrieval: lesson not found: ${id}`);
+    }
+    const event: RetrievalEvent = { at: now, ids };
+    this.ctx?.appendToLog(RETRIEVALS_LOG, event);
+    this.applyRetrieval(event);
+  }
+
+  private applyRetrieval(event: RetrievalEvent): void {
+    if ('baseline' in event) {
+      for (const usage of event.baseline) Object.assign(this.require(usage.id, 'retrieval baseline'), usage);
+      return;
+    }
+    for (const id of event.ids) {
+      const lesson = this.require(id, 'retrieval');
+      const r = retrievability(lesson, event.at);
       const stability = lesson.stability ?? INITIAL_STABILITY_DAYS;
       lesson.stability = stability * (1 + SPACING_GAIN * (1 - r));
       lesson.retrievalCount = (lesson.retrievalCount ?? 0) + 1;
-      lesson.lastRetrieved = now;
+      lesson.lastRetrieved = event.at;
     }
-    this.save();
+  }
+
+  /** Versions only add or change fields, never remove them, so assigning over the current lesson is exact. */
+  private applyVersion(version: LessonVersion): void {
+    const lesson = this.byId.get(version.id);
+    if (lesson) {
+      Object.assign(lesson, version);
+      return;
+    }
+    const added: Lesson = { ...version };
+    this.lessons.push(added);
+    this.byId.set(added.id, added);
+  }
+
+  private require(id: string, what: string): Lesson {
+    const lesson = this.byId.get(id);
+    if (!lesson) throw new Error(`lessons: ${what} names unknown lesson ${id}`);
+    return lesson;
+  }
+
+  /**
+   * Stores written before the logs kept every lesson in one snapshot state.
+   * Its lessons become the first versions and their usage one baseline event.
+   * The snapshot itself is left untouched.
+   */
+  private migrateSnapshot(ctx: ModuleContext): void {
+    const lessons = ctx.getState<{ lessons?: Lesson[] }>()?.lessons ?? [];
+    if (lessons.length === 0) return;
+    for (const lesson of lessons) ctx.appendToLog(VERSIONS_LOG, versionOf(lesson));
+    const baseline = lessons
+      .filter(l => l.retrievalCount !== undefined || l.lastRetrieved !== undefined || l.stability !== undefined)
+      .map(l => ({ id: l.id, retrievalCount: l.retrievalCount, lastRetrieved: l.lastRetrieved, stability: l.stability }));
+    if (baseline.length > 0) ctx.appendToLog(RETRIEVALS_LOG, { at: Date.now(), baseline } satisfies RetrievalEvent);
   }
 
   // =========================================================================
@@ -394,14 +459,14 @@ export class LessonsModule implements Module {
     const supersedes = input.supersedes ?? [];
     const superseded: Lesson[] = [];
     for (const id of supersedes) {
-      const old = this.state.lessons.find(l => l.id === id);
+      const old = this.byId.get(id);
       if (!old) return { success: false, error: `Lesson not found: ${id}`, isError: true };
       if (old.deprecated) return { success: false, error: `Lesson already deprecated: ${id}`, isError: true };
       superseded.push(old);
     }
 
     if (!input.force) {
-      const duplicates = this.state.lessons
+      const duplicates = this.lessons
         .filter(l => !l.deprecated && !supersedes.includes(l.id))
         .map(l => ({ lesson: l, similarity: lexicalSimilarity(input.content, l.content) }))
         .filter(d => d.similarity >= DUPLICATE_THRESHOLD)
@@ -433,14 +498,14 @@ export class LessonsModule implements Module {
       deprecated: false,
     };
 
-    this.state.lessons.push(lesson);
+    this.applyVersion(lesson);
     for (const old of superseded) {
       old.deprecated = true;
       old.deprecationReason = `Superseded by ${lesson.id}`;
       old.supersededBy = lesson.id;
       old.updated = lesson.created;
     }
-    this.save();
+    this.save(lesson, ...superseded);
 
     return {
       success: true,
@@ -454,7 +519,7 @@ export class LessonsModule implements Module {
   }
 
   private handleUpdate(input: UpdateInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = this.byId.get(input.id);
     if (!lesson) {
       return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
     }
@@ -475,13 +540,13 @@ export class LessonsModule implements Module {
       lesson.evidence = [...existing];
     }
     lesson.updated = Date.now();
-    this.save();
+    this.save(lesson);
 
     return { success: true, data: { id: lesson.id, message: 'Lesson updated' } };
   }
 
   private handleDeprecate(input: DeprecateInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = this.byId.get(input.id);
     if (!lesson) {
       return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
     }
@@ -489,7 +554,7 @@ export class LessonsModule implements Module {
     lesson.deprecated = true;
     lesson.deprecationReason = input.reason;
     lesson.updated = Date.now();
-    this.save();
+    this.save(lesson);
 
     return { success: true, data: { id: lesson.id, message: 'Lesson deprecated' } };
   }
@@ -497,8 +562,8 @@ export class LessonsModule implements Module {
   private handleQuery(input: QueryInput): ToolResult {
     const limit = input.limit ?? 20;
     let results = input.includeDeprecated
-      ? [...this.state.lessons]
-      : this.state.lessons.filter(l => !l.deprecated);
+      ? [...this.lessons]
+      : this.lessons.filter(l => !l.deprecated);
 
     // Filter by minimum confidence
     if (input.minConfidence !== undefined) {
@@ -547,8 +612,8 @@ export class LessonsModule implements Module {
   private handleList(input: ListInput): ToolResult {
     const limit = input.limit ?? 50;
     let results = input.includeDeprecated
-      ? [...this.state.lessons]
-      : this.state.lessons.filter(l => !l.deprecated);
+      ? [...this.lessons]
+      : this.lessons.filter(l => !l.deprecated);
 
     const searched = results.length;
     const tagCheck = checkTags(input.tags, results);
@@ -593,7 +658,7 @@ export class LessonsModule implements Module {
   }
 
   private handleBoost(input: IdInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = this.byId.get(input.id);
     if (!lesson) {
       return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
     }
@@ -601,13 +666,13 @@ export class LessonsModule implements Module {
     // Diminishing returns boost
     lesson.confidence = Math.min(1, lesson.confidence + 0.1 * (1 - lesson.confidence));
     lesson.updated = Date.now();
-    this.save();
+    this.save(lesson);
 
     return { success: true, data: { id: lesson.id, confidence: lesson.confidence } };
   }
 
   private handleDemote(input: IdInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = this.byId.get(input.id);
     if (!lesson) {
       return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
     }
@@ -615,22 +680,23 @@ export class LessonsModule implements Module {
     // Diminishing returns demote
     lesson.confidence = Math.max(0, lesson.confidence - 0.1 * lesson.confidence);
     lesson.updated = Date.now();
-    this.save();
+    this.save(lesson);
 
     return { success: true, data: { id: lesson.id, confidence: lesson.confidence } };
   }
 
-  private save(): void {
-    this.ctx?.setState(this.state);
+  /** Append the new version of each changed lesson; usage-only changes never come here. */
+  private save(...changed: Lesson[]): void {
+    for (const lesson of changed) this.ctx?.appendToLog(VERSIONS_LOG, versionOf(lesson));
     if (this.globalPath) {
       this.saveToGlobal();
     }
   }
 
   /** Merge lessons from the global JSON file. Newer `updated` wins on ID conflicts. */
-  private mergeFromGlobal(): void {
+  private mergeFromGlobal(ctx: ModuleContext): void {
     if (!this.globalPath) return;
-    let global: LessonsState;
+    let global: { lessons: Lesson[] };
     try {
       global = JSON.parse(readFileSync(this.globalPath, 'utf-8'));
     } catch {
@@ -638,29 +704,23 @@ export class LessonsModule implements Module {
     }
     if (!Array.isArray(global.lessons)) return;
 
-    const byId = new Map(this.state.lessons.map(l => [l.id, l]));
-    let merged = false;
     for (const gl of global.lessons) {
-      const existing = byId.get(gl.id);
-      if (!existing) {
-        this.state.lessons.push(gl);
-        merged = true;
-      } else if (gl.updated > existing.updated) {
-        Object.assign(existing, gl);
-        merged = true;
-      }
-    }
-    if (merged) {
-      this.ctx?.setState(this.state);
+      const existing = this.byId.get(gl.id);
+      if (existing && gl.updated <= existing.updated) continue;
+      // Usage is this agent's own, from its retrieval log; files written
+      // before that carry usage fields, which are not merged.
+      const version = versionOf(gl);
+      ctx.appendToLog(VERSIONS_LOG, version);
+      this.applyVersion(version);
     }
   }
 
-  /** Write current lessons to the global JSON file. */
+  /** Write current lesson content (no usage) to the global JSON file. */
   private saveToGlobal(): void {
     if (!this.globalPath) return;
     try {
       mkdirSync(dirname(this.globalPath), { recursive: true });
-      writeFileSync(this.globalPath, JSON.stringify({ lessons: this.state.lessons }, null, 2));
+      writeFileSync(this.globalPath, JSON.stringify({ lessons: this.lessons.map(versionOf) }, null, 2));
     } catch {
       // Best-effort — don't break the module if the file can't be written
     }

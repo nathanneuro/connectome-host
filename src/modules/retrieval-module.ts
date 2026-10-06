@@ -29,7 +29,7 @@ import type {
 } from '@animalabs/agent-framework';
 import type { ContextInjection } from '@animalabs/context-manager';
 import { rankScore, type LessonsModule, type Lesson } from './lessons-module.js';
-import { bm25Scores } from './lesson-search.js';
+import { LexicalIndex } from './lesson-search.js';
 import { dot, type RetrievalModels } from './retrieval-models.js';
 import {
   RetrievalTraceStore,
@@ -142,6 +142,8 @@ export class RetrievalModule implements Module {
   private cachedSourceTraceId: number | undefined;
   /** Document embeddings keyed by lessonDocument() text, pruned to the live library each run. */
   private readonly documentVectors = new Map<string, Float32Array>();
+  /** BM25 over the eligible library, re-tokenizing only lessons that changed. */
+  private readonly lexicalIndex = new LexicalIndex();
   private readonly traceStore = new RetrievalTraceStore();
 
   constructor(config: RetrievalModuleConfig) {
@@ -322,16 +324,14 @@ export class RetrievalModule implements Module {
     const live = new Set(documents);
     for (const key of this.documentVectors.keys()) if (!live.has(key)) this.documentVectors.delete(key);
 
+    this.lexicalIndex.sync(lessons);
     const queryVectors = await this.config.models.embed(queries, 'query');
     const lexicalLists: string[][] = [];
     const denseLists: string[][] = [];
     queries.forEach((query, q) => {
-      const bm25 = bm25Scores(query, lessons);
-      lexicalLists.push(lessons
-        .map((l, i) => ({ id: l.id, score: bm25[i] }))
-        .filter(x => x.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .map(x => x.id));
+      lexicalLists.push([...this.lexicalIndex.scores(query)]
+        .sort((a, b) => b[1] - a[1])
+        .map(([id]) => id));
       denseLists.push(lessons
         .map((l, i) => ({ id: l.id, score: dot(queryVectors[q], this.documentVectors.get(documents[i])!) }))
         .sort((a, b) => b.score - a.score)

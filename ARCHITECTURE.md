@@ -171,7 +171,7 @@ Disabled entirely with `modules.workspace: false` (no filesystem access at all).
 
 ### Lessons Module (`lessons-module.ts`)
 
-Persistent knowledge store backed by Chronicle state snapshots.
+Persistent knowledge store backed by two append-only Chronicle logs: `versions` (each write appends the new version of each lesson it touched) and `retrievals` (one `{at, ids}` event per injection). Usage strength is derived by replaying retrievals at start, never stored, so a retrieval turn writes ~0.3 KB however large the library (a full-state snapshot wrote the whole library: ~430 KB per turn at 1,000 lessons). Stores from before the logs migrate once on start: their lessons become the first versions and their usage one baseline event; the old snapshot is left untouched. The shared `lessons.json` carries content only and is rewritten only when content changes.
 
 **Data model**:
 ```typescript
@@ -221,7 +221,8 @@ Lesson retrieval with local models — no API calls. Runs in `gatherContext()` b
 
 - Models run in-process through `node-llama-cpp` (Metal / CUDA / Vulkan / CPU, auto-selected), GGUF Q8_0, ~1.3 GB downloaded on first use to `CONNECTOME_MODELS_DIR` (default `~/.cache/connectome-host/models`). Loading starts at host startup so the first turn doesn't wait on it; a load failure resurfaces as an `error` trace on every retrieval.
 - No concept-extraction step: several short queries replace it, so no single embedding averages a long multi-topic window. BM25 and dense lists from every query are merged by reciprocal rank fusion; the top `maxCandidates` (default 16) go to the reranker.
-- Lesson embeddings are cached by document text, recomputed on edit, and pruned when a lesson leaves the eligible set.
+- Lesson embeddings are cached in memory by document text and on disk in `$DATA_DIR/retrieval-cache/<model>.f32` (fixed-width records keyed by sha256 of the text), so a restart does not re-embed the library; an edited lesson gets a new embedding.
+- BM25 runs over an inverted index synced to the eligible library each turn: only changed lessons are re-tokenized, and a query reads only its own terms' postings.
 - The reranker judges each candidate against the last ~1200 characters of conversation with a task-specific instruction. Its scores are bimodal; the default `relevanceThreshold` of 0.3 comes from `scripts/retrieval-calibration/` (synthetic set, see the script).
 - Relevant lessons are injected in `rankScore` order, up to `maxInjected`: the reranker decides what is relevant, salience decides what comes to mind first.
 - Measured on an M5 Mac (Metal): median ~650 ms per turn with 16 candidates; rerank cost is linear in `maxCandidates` and in the conversation-tail length.

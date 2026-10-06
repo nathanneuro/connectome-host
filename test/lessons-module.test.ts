@@ -7,17 +7,33 @@ import {
   retrievability,
   type Lesson,
 } from '../src/modules/lessons-module.js';
-import { bm25Scores, lexicalSimilarity } from '../src/modules/lesson-search.js';
+import { LexicalIndex, lexicalSimilarity } from '../src/modules/lesson-search.js';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 const DAY = 86_400_000;
 
-async function started(): Promise<LessonsModule> {
-  let state: unknown;
-  const mod = new LessonsModule();
-  await mod.start({
-    getState: () => state,
-    setState: (s: unknown) => { state = s; },
-  } as unknown as ModuleContext);
+/** In-memory stand-in for a module's chronicle state: one snapshot plus append-only logs. */
+class FakeStore {
+  state: unknown = null;
+  logs = new Map<string, unknown[]>();
+
+  context(): ModuleContext {
+    return {
+      getState: () => this.state,
+      setState: (s: unknown) => { this.state = s; },
+      registerLogState: (name: string) => { if (!this.logs.has(name)) this.logs.set(name, []); },
+      appendToLog: (name: string, item: unknown) => { this.logs.get(name)!.push(structuredClone(item)); },
+      getLog: (name: string) => structuredClone(this.logs.get(name) ?? []),
+      getLogLength: (name: string) => this.logs.get(name)?.length ?? 0,
+    } as unknown as ModuleContext;
+  }
+}
+
+async function started(store = new FakeStore(), globalPath?: string): Promise<LessonsModule> {
+  const mod = new LessonsModule(globalPath ? { globalPath } : undefined);
+  await mod.start(store.context());
   return mod;
 }
 
@@ -222,30 +238,124 @@ describe('query and list report what they searched', () => {
   });
 });
 
-describe('bm25Scores', () => {
+describe('LexicalIndex', () => {
   const docs = [
     lesson({ id: 'a', content: 'OAuth tokens expire after one hour' }),
     lesson({ id: 'b', content: 'Deploys are frozen on Fridays' }),
     lesson({ id: 'c', content: 'tokens tokens everywhere, and the OAuth docs are thin', tags: ['docs'] }),
   ];
+  const index = new LexicalIndex();
+  index.sync(docs);
 
-  test('matches whole words only and scores non-matching lessons zero', () => {
-    const [a, b] = bm25Scores('expire', docs);
-    expect(a).toBeGreaterThan(0);
-    expect(b).toBe(0);
-    expect(bm25Scores('pire', docs)).toEqual([0, 0, 0]);
+  test('matches whole words only; lessons sharing no term are absent', () => {
+    const scores = index.scores('expire');
+    expect(scores.get('a')).toBeGreaterThan(0);
+    expect(scores.has('b')).toBe(false);
+    expect(index.scores('pire').size).toBe(0);
   });
 
   test('rare terms outweigh common ones', () => {
-    const [a, , c] = bm25Scores('oauth expire', docs);
-    expect(a).toBeGreaterThan(c);
+    const scores = index.scores('oauth expire');
+    expect(scores.get('a')!).toBeGreaterThan(scores.get('c')!);
   });
 
   test('stopword-only queries match nothing', () => {
-    expect(bm25Scores('the and of', docs)).toEqual([0, 0, 0]);
+    expect(index.scores('the and of').size).toBe(0);
   });
 
   test('tags are searchable', () => {
-    expect(bm25Scores('docs', docs)[2]).toBeGreaterThan(0);
+    expect(index.scores('docs').get('c')).toBeGreaterThan(0);
+  });
+
+  test('an incrementally synced index scores exactly like a fresh one', () => {
+    const live = new LexicalIndex();
+    live.sync(docs);
+    const edited = [
+      lesson({ id: 'a', content: 'OAuth tokens now expire after ten minutes' }),
+      docs[2]!,
+      lesson({ id: 'd', content: 'Fridays are for retros, not deploys' }),
+    ];
+    live.sync(edited);
+    const fresh = new LexicalIndex();
+    fresh.sync(edited);
+    for (const query of ['oauth expire', 'deploys fridays', 'tokens docs', 'frozen']) {
+      expect([...live.scores(query)].sort()).toEqual([...fresh.scores(query)].sort());
+    }
+    expect(live.scores('frozen').size).toBe(0);
+  });
+});
+
+
+describe('append-only storage', () => {
+  test('a restart replays the logs into exactly the lessons and usage it left', async () => {
+    const store = new FakeStore();
+    const mod = await started(store);
+    const a = (await create(mod, { content: 'OAuth tokens expire after one hour', tags: ['auth'] })).data as { id: string };
+    const b = (await create(mod, { content: 'Deploys freeze on Fridays', tags: ['ops'] })).data as { id: string };
+    await mod.handleToolCall({ id: 'u', name: 'update', input: { id: a.id, content: 'OAuth tokens expire after ten minutes' } } as never);
+    await mod.handleToolCall({ id: 'b', name: 'boost', input: { id: a.id } } as never);
+    await mod.handleToolCall({ id: 'd', name: 'deprecate', input: { id: b.id, reason: 'policy ended' } } as never);
+    const t0 = mod.getLessons()[0]!.created;
+    mod.recordRetrieval([a.id], t0 + DAY);
+    mod.recordRetrieval([a.id], t0 + 30 * DAY);
+
+    const restarted = await started(store);
+    expect(restarted.getLessons()).toEqual(mod.getLessons());
+    expect(restarted.getLessons()[0]).toMatchObject({ retrievalCount: 2, lastRetrieved: t0 + 30 * DAY });
+    expect(store.state).toBeNull();
+  });
+
+  test('a retrieval appends one event naming its lessons, whatever the library size', async () => {
+    const store = new FakeStore();
+    const mod = await started(store);
+    for (let i = 0; i < 50; i++) await create(mod, { content: `distinct lesson number ${i} about topic${i}`, tags: [], force: true });
+    const versions = store.logs.get('versions')!.length;
+
+    mod.recordRetrieval([mod.getLessons()[7]!.id, mod.getLessons()[9]!.id], 1_000);
+
+    expect(store.logs.get('versions')!.length).toBe(versions);
+    expect(store.logs.get('retrievals')).toEqual([{ at: 1_000, ids: [mod.getLessons()[7]!.id, mod.getLessons()[9]!.id] }]);
+  });
+
+  test('a pre-log snapshot migrates once, keeps its usage, and is left untouched', async () => {
+    const store = new FakeStore();
+    const old = [
+      lesson({ id: 'a', content: 'used', created: 1, updated: 1, retrievalCount: 3, lastRetrieved: 50, stability: 12 }),
+      lesson({ id: 'b', content: 'never used', created: 2, updated: 2, previousContents: [{ content: 'older', replacedAt: 2 }] }),
+    ];
+    store.state = { lessons: structuredClone(old), externalIdMap: {} };
+
+    const mod = await started(store);
+    expect(mod.getLessons()).toEqual(old);
+    expect(store.state).toEqual({ lessons: old, externalIdMap: {} });
+    expect(store.logs.get('versions')).toHaveLength(2);
+    expect(store.logs.get('retrievals')).toHaveLength(1);
+
+    await started(store);
+    expect(store.logs.get('versions')).toHaveLength(2);
+  });
+
+  test('the global file holds content only, is not rewritten by retrievals, and never imports usage', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lessons-global-'));
+    try {
+      const globalPath = join(dir, 'lessons.json');
+      const mod = await started(new FakeStore(), globalPath);
+      const { id } = (await create(mod, { content: 'Deploys freeze on Fridays', tags: [] })).data as { id: string };
+      const written = readFileSync(globalPath, 'utf-8');
+      mod.recordRetrieval([id], Date.now());
+      expect(readFileSync(globalPath, 'utf-8')).toBe(written);
+      expect(written).not.toContain('retrievalCount');
+
+      writeFileSync(globalPath, JSON.stringify({
+        lessons: [lesson({ id: 'shared', content: 'from another agent', updated: 5, retrievalCount: 99, lastRetrieved: 5 })],
+      }));
+      const store = new FakeStore();
+      const other = await started(store, globalPath);
+      expect(other.getLessons()).toEqual([lesson({ id: 'shared', content: 'from another agent', updated: 5 })]);
+      rmSync(globalPath);
+      expect((await started(store)).getLessons().map(l => l.id)).toEqual(['shared']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -39,6 +39,7 @@ import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
+import { EmbeddingCache, withEmbeddingCache } from './modules/embedding-cache.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
 import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import { LlamaRetrievalModels } from './modules/retrieval-models.js';
@@ -267,7 +268,12 @@ async function createFramework(
     // Download/load in the background so the first turn isn't the one that
     // waits; a failure here resurfaces as an error trace on every retrieval.
     retrievalModels.prepare().catch(err => console.error('Retrieval models failed to load:', err));
-    moduleInstances.push(new RetrievalModule(buildRetrievalModuleConfig(retrievalModels, modules.retrieval)));
+    const embeddingCache = new EmbeddingCache(join(
+      config.dataDir, 'retrieval-cache', `${retrievalModels.embeddingModel.replace(/[^A-Za-z0-9.-]+/g, '_')}.f32`,
+    ));
+    moduleInstances.push(new RetrievalModule(buildRetrievalModuleConfig(
+      withEmbeddingCache(retrievalModels, embeddingCache), modules.retrieval,
+    )));
   }
 
   // History browsing (native chronicle indexes + summary-backed overview).
