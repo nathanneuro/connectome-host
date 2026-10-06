@@ -1,0 +1,1 @@
+The TUI status bar shows the agent's sleep/wake state ("asleep · wakes 19:00", "awake · 24m left") when the recipe wires heartbeat-mcpl's status file (any MCP server env with `HEARTBEAT_STATUS_FILE`). Nothing else to configure.

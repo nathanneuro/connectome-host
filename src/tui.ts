@@ -15,6 +15,7 @@
  * Fleet view: interactive tree with expand/collapse (↑↓ navigate, ⏎ toggle).
  */
 
+import { heartbeatStatusPath, HeartbeatStatusReader } from './heartbeat-status.js';
 import {
   createCliRenderer,
   type CliRenderer,
@@ -595,9 +596,15 @@ export async function runTui(app: AppContext): Promise<void> {
     return name === rootAgentName ? app.recipe?.agent?.contextBudgetTokens : undefined;
   }
 
+  // The agent's sleep/wake state, when its recipe wires heartbeat-mcpl's status file.
+  const heartbeatPath = heartbeatStatusPath(app.recipe?.mcpServers);
+  const heartbeatReader = heartbeatPath ? new HeartbeatStatusReader(heartbeatPath) : null;
+
   function updateStatus() {
     const topAlert = pickTopAlert([...opsAlerts.values()].map(a => a.kind));
     let left = formatStatusLeft(state, SPINNER[spinnerFrame], streamOutputTokens, opsAlerts.size, topAlert);
+    const heartbeat = heartbeatReader?.segment();
+    if (heartbeat) left = `${heartbeat} │ ${left}`;
     // An active ops alert repaints the whole left segment — a one-cell glyph
     // in default gray is exactly the kind of signal that gets scrolled past.
     statusLeft.fg = opsAlerts.size > 0 ? RED : GRAY;
