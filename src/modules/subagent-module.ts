@@ -223,6 +223,14 @@ export interface SubagentPeekSnapshot {
 // Fork materialisation
 // ---------------------------------------------------------------------------
 
+/** Lesson tools a context-free spawn keeps by default: reads only. Any other
+ *  `lessons--` tool, including one added later, counts as a write. */
+const LESSON_READ_TOOLS = new Set(['lessons--query', 'lessons--list']);
+
+function isLessonWrite(toolName: string): boolean {
+  return toolName.startsWith('lessons--') && !LESSON_READ_TOOLS.has(toolName);
+}
+
 /**
  * Build the tool_result text the fork stream sees in place of the generic
  * "Subagent X forked. Running in background." that the parent stream sees.
@@ -695,7 +703,7 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: all except lesson writes — a fresh subagent lacks your context to judge what the lesson store already holds; list e.g. lessons--create here to grant it). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
             timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
@@ -1726,7 +1734,7 @@ export class SubagentModule implements Module {
             autoTickOnNewMessage: true,
             maxMessageTokens: 10_000,
           }),
-          allowedTools: this.filterToolNames(input.tools, callerDepth),
+          allowedTools: this.filterToolNames(input.tools, callerDepth, 'spawn'),
         });
 
         // Track depth for recursive fork/spawn calls from this agent
@@ -1881,7 +1889,7 @@ export class SubagentModule implements Module {
             autoTickOnNewMessage: true,
             maxMessageTokens: 10_000,
           }),
-          allowedTools: this.filterToolNames(undefined, callerDepth),
+          allowedTools: this.filterToolNames(undefined, callerDepth, 'fork'),
         });
 
         // Track depth for recursive fork/spawn calls from this agent
@@ -2066,8 +2074,13 @@ export class SubagentModule implements Module {
    * Build the allowedTools list for a subagent.
    * Removes subagent tools if at depth limit.
    *
+   * A spawn with no explicit `tools` also loses lesson writes: it starts
+   * without the caller's context and gets no lesson injection, so it cannot
+   * judge what the shared store already holds, and its lessons would land as
+   * duplicates or contradictions. Naming a write tool in `tools` grants it.
+   * A fork inherits the caller's context and keeps everything.
    */
-  private filterToolNames(allowedTools?: string[], callerDepth = 0): 'all' | string[] {
+  private filterToolNames(allowedTools: string[] | undefined, callerDepth: number, kind: 'spawn' | 'fork'): 'all' | string[] {
     // Always include subagent--return — subagents need it to deliver results
     const ensureReturn = (list: string[]) => {
       if (!list.includes('subagent--return')) list.push('subagent--return');
@@ -2075,18 +2088,19 @@ export class SubagentModule implements Module {
     };
 
     // Use per-agent depth (from caller) rather than the module's static depth
-    if (callerDepth + 1 >= this.maxDepth) {
-      const allTools = this.getFramework().getAllTools();
-      const filtered = allTools
-        .filter(t => !t.name.startsWith('subagent--'))
-        .map(t => t.name);
-      if (allowedTools) {
-        const allowed = new Set(allowedTools);
-        return ensureReturn(filtered.filter(n => allowed.has(n)));
-      }
-      return ensureReturn(filtered);
+    const atMaxDepth = callerDepth + 1 >= this.maxDepth;
+    const dropLessonWrites = kind === 'spawn' && !allowedTools;
+    if (!atMaxDepth && !dropLessonWrites) {
+      return allowedTools ? ensureReturn(allowedTools) : 'all';
     }
-    return allowedTools ? ensureReturn(allowedTools) : 'all';
+    let names = this.getFramework().getAllTools().map(t => t.name);
+    if (atMaxDepth) names = names.filter(n => !n.startsWith('subagent--'));
+    if (dropLessonWrites) names = names.filter(n => !isLessonWrite(n));
+    if (allowedTools) {
+      const allowed = new Set(allowedTools);
+      names = names.filter(n => allowed.has(n));
+    }
+    return ensureReturn(names);
   }
 
 }

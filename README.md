@@ -471,6 +471,7 @@ bun install      # or npm install; the postinstall step builds the web UI
 | `CODEX_BASE_URL` | ChatGPT Codex backend | Optional subscription transport override |
 | `MODEL` | from recipe, else `claude-opus-4-6` (`gpt-5.4` for `openai-codex`) | Override model (wins over the recipe) |
 | `DATA_DIR` | `./data` | Session, recipe and log storage |
+| `REQUIRE_EXISTING_AGENT` | off | `1`/`true`: refuse to start when `DATA_DIR` holds no agent, instead of creating a new one (set it on deployments, so a mistyped path or unmounted volume fails loudly) |
 | `AGENT_TIMEZONE` | process timezone | Agent-facing clock when the recipe sets no `agent.timezone` |
 | `SLEEP_PRIVILEGED_FILE` | `./sleep-privileged.json` | Who may wake the agent during `sleep` |
 | `OBSERVERS_FILE` | `$DATA_DIR/observers.json` | Web UI observer grants |

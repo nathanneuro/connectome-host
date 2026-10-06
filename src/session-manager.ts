@@ -74,6 +74,11 @@ export class SessionManager {
     this.sessionsDir = join(dataDir, 'sessions');
   }
 
+  /** Whether this data dir already holds an agent: a session index, or a legacy store awaiting migration. */
+  hasAgent(): boolean {
+    return existsSync(this.indexPath) || existsSync(join(this.dataDir, 'store'));
+  }
+
   /** Load the session index from disk. Returns empty index if file doesn't exist. */
   load(): SessionIndex {
     if (!existsSync(this.indexPath)) {

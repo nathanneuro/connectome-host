@@ -13,6 +13,7 @@
  *   ANTHROPIC_API_KEY   - Required (not needed for recipe provider "mock")
  *   MODEL               - Override model (default: from recipe or claude-opus-4-6)
  *   DATA_DIR            - Data directory for sessions (default: ./data)
+ *   REQUIRE_EXISTING_AGENT - 1/true: refuse to start if DATA_DIR holds no agent
  */
 
 import {
@@ -857,6 +858,21 @@ function countLines(path: string): number {
 // ---------------------------------------------------------------------------
 
 async function main() {
+  // A wrong DATA_DIR (typo, unmounted volume, another cwd) would start a fresh
+  // agent with no past, which then writes a second identity. Checked before
+  // anything writes into the dir; deployments make it fatal.
+  if (!new SessionManager(config.dataDir).hasAgent()) {
+    const where = resolve(config.dataDir);
+    if (/^(1|true)$/i.test(process.env.REQUIRE_EXISTING_AGENT ?? '')) {
+      console.error(
+        `No agent at ${where}, and REQUIRE_EXISTING_AGENT is set. ` +
+        `Check DATA_DIR, or unset REQUIRE_EXISTING_AGENT to create a new agent there.`,
+      );
+      process.exit(1);
+    }
+    console.warn(`No agent at ${where}: creating a new one.`);
+  }
+
   const recipe = await resolveRecipe();
   const provider = recipe.agent.provider ?? 'anthropic';
 

@@ -1,0 +1,1 @@
+`subagent--spawn` no longer grants lesson writes by default. A spawned subagent starts without its caller's context and gets no lesson injection, so it cannot judge what the shared lesson store already holds; it keeps `lessons--query` and `lessons--list`, and any other `lessons--` tool must be named in `tools`. Forks are unchanged.

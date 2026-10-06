@@ -1,0 +1,1 @@
+`REQUIRE_EXISTING_AGENT=1` makes the host refuse to start when `DATA_DIR` holds no agent (no `sessions.json`, no legacy store), so a mistyped path, an unmounted volume or a different working directory fails loudly instead of starting a fresh agent with no past. Without it, creating a new agent now logs the absolute data path.
